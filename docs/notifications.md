@@ -18,7 +18,11 @@ A toast lives on screen for at least 5s (low), 8s (normal), or forever
 (critical), stretched up to 30s if the sender asked for a longer
 `expire_timeout`. Hovering pauses the countdown, and a content update restarts
 it — new text deserves a full look. Left-click invokes the default action,
-right-click or the hover-revealed close button dismisses.
+right-click or the hover-revealed close button dismisses, and the
+hover-revealed snooze button opens a picker of times to bring the toast back:
+five minutes before the next :00 or :30 (what `snoozeOne` and its keybinding
+use), 15 minutes, an hour, or 9am tomorrow. The picker's time reads in the bar
+clock's 12- or 24-hour format.
 
 Every on-screen popup is mirrored to its own file under
 `~/.local/state/omarchy/notifications/` (one JSON line per file, named
@@ -36,6 +40,23 @@ in place, under the popup's original file identity. Restored rows carry ids
 from a dead server generation (ids restart from 1 each shell process), so
 they are keyed by timestamp+id and never matched against live objects — a
 fresh notification reusing an old id must not dismiss or replace them.
+
+## Snoozing
+
+The snooze choices come from `NotificationLogic.snoozeOptions`, as absolute
+wall-clock times; IPC `snooze <minutes>` takes an arbitrary duration. A snoozed toast leaves the screen like a dismissal — the sender is told it
+closed — but its file moves into `notifications/snoozed/` instead of history,
+rewritten with a `snoozeUntil` wall-clock time. The service mirrors that
+directory in memory and checks it every few seconds; a due entry moves back
+into `notifications/` and returns to the top of the stack with a fresh
+lifetime, persisted as a `deadline` because its original timestamp would make
+a restart judge it long expired. It comes back as a restored row: the sender's
+notification is gone by then, so a click runs the persisted `--exec` command or
+falls back to focusing the sending app, never a libnotify action.
+
+Snoozes survive shell restarts (the directory is read back at startup, and
+anything that came due meanwhile wakes on the first check) and are held back
+while silencing is on, waking once it is turned off.
 
 ## Silencing
 
@@ -158,7 +179,7 @@ as a `busctl` option; the summary/body themselves are never parsed as options.)
   the `omarchy.weather` shell panel.
 
 Keybindings live in `default/hypr/bindings/utilities.lua`: `Super+comma`
-variants map to the IPC methods `dismissOne`, `dismissAll`, `invokeLast`,
+variants map to the IPC methods `dismissOne`, `dismissAll`, `invokeLast`, `snoozeOne`,
 `showHistory`, and the silencing toggle.
 
 ## How subsystems plug in

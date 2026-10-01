@@ -166,6 +166,7 @@ All capture options are also accessible under _Trigger > Capture_ in the Omarchy
 | `Super + Shift + ,` | Dismiss all notifications |
 | `Super + Ctrl + ,` | Toggle silencing notifications  |
 | `Super + Alt + ,` | Invoke most recent notification  |
+| `Super + Ctrl + Shift + ,` | Snooze most recent notification until 5 minutes before the half hour  |
 | `Super + Shift + Alt + ,` | Open notification history  |
 
 ## Style

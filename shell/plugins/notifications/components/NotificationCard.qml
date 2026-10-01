@@ -33,6 +33,26 @@ BorderSurface {
   readonly property bool hovered: hoverTracker.hovered
 
   signal closeRequested()
+  // until is an absolute wall-clock time from NotificationLogic.snoozeOptions.
+  signal snoozeRequested(double until)
+
+  // The snooze button swaps the text for a row of times to snooze until.
+  // Leaving the card puts the text back.
+  property bool choosingSnooze: false
+  property var snoozeChoices: []
+  onHoveredChanged: if (!hovered) choosingSnooze = false
+
+  // Clock format for the picker's time choice, matched to the bar clock.
+  property string snoozeTimeFormat: "HH:mm"
+
+  function tint(c, a) {
+    return Qt.rgba(c.r, c.g, c.b, a)
+  }
+
+  function snoozeLabel(choice) {
+    if (choice.kind === "time") return Qt.formatTime(new Date(choice.until), snoozeTimeFormat)
+    return choice.label
+  }
   signal cardClicked()
   // Prefer per-notification media/avatar data, then fall back to the app icon.
   // The `check` flag avoids Qt's missing-texture placeholder for unknown names.
@@ -156,8 +176,8 @@ BorderSurface {
       ColumnLayout {
         Layout.fillWidth: true
         Layout.alignment: Qt.AlignVCenter
-        // Keep the first line clear of the hover-revealed close button.
-        Layout.rightMargin: Style.space(10)
+        // Keep the first line clear of the hover-revealed buttons.
+        Layout.rightMargin: Style.space(28)
         spacing: Style.space(2)
 
         Text {
@@ -181,7 +201,7 @@ BorderSurface {
         Text {
           Layout.fillWidth: true
           Layout.topMargin: Style.space(2)
-          visible: root.sanitizedBody.length > 0
+          visible: root.sanitizedBody.length > 0 && !root.choosingSnooze
           text: root.styledBody
           textFormat: Text.StyledText
           font.family: "Liberation Sans"
@@ -191,6 +211,90 @@ BorderSurface {
           elide: Text.ElideRight
           maximumLineCount: 3
         }
+
+        // Snooze choices, in place of the body while the picker is open.
+        Flow {
+          Layout.fillWidth: true
+          Layout.topMargin: Style.space(4)
+          visible: root.choosingSnooze
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.snoozeChoices
+
+            delegate: Rectangle {
+              id: chip
+              required property var modelData
+              required property int index
+              // The first choice is the one `snoozeOne` takes.
+              readonly property bool primary: index === 0
+              readonly property bool lit: chipArea.containsMouse || primary
+
+              width: chipText.implicitWidth + Style.space(18)
+              height: chipText.implicitHeight + Style.space(8)
+              radius: height / 2
+              color: chipArea.containsMouse
+                ? Color.notifications.countdown
+                : root.tint(primary ? Color.notifications.countdown : Color.notifications.text, primary ? 0.22 : 0.08)
+
+              Behavior on color { ColorAnimation { duration: Style.duration(100) } }
+
+              Text {
+                id: chipText
+                anchors.centerIn: parent
+                textFormat: Text.PlainText
+                text: root.snoozeLabel(chip.modelData)
+                color: chipArea.containsMouse ? Color.notifications.background : (chip.lit ? Color.notifications.text : root.bodyColor)
+                font.family: "Liberation Sans"
+                font.pixelSize: Style.font.title
+                font.bold: chip.primary
+              }
+
+              MouseArea {
+                id: chipArea
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: {
+                  root.choosingSnooze = false
+                  root.snoozeRequested(chip.modelData.until)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Hover-revealed snooze, beside the close button and stacked the same way.
+  Item {
+    anchors.top: closeButton.top
+    anchors.right: closeButton.left
+    width: Style.space(18)
+    height: Style.space(18)
+    visible: opacity > 0
+    opacity: root.hovered ? 1 : 0
+
+    Behavior on opacity { NumberAnimation { duration: Style.duration(100) } }
+
+    Text {
+      anchors.centerIn: parent
+      textFormat: Text.PlainText
+      text: "󰒲"
+      color: snoozeArea.containsMouse || root.choosingSnooze ? Color.notifications.text : root.dimColor
+      font.family: root.fontFamily
+      font.pixelSize: Math.round(Style.font.caption * 1.44)
+    }
+
+    MouseArea {
+      id: snoozeArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: {
+        root.snoozeChoices = NotificationLogic.snoozeOptions(Date.now())
+        root.choosingSnooze = !root.choosingSnooze
       }
     }
   }
@@ -198,6 +302,7 @@ BorderSurface {
   // Hover-revealed close. Stacked after mainColumn so its MouseArea sits
   // above the full-card one and the click never reaches cardClicked.
   Item {
+    id: closeButton
     anchors.top: parent.top
     anchors.right: parent.right
     anchors.topMargin: root.borderTop + Style.space(3)

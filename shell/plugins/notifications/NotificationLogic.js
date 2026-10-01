@@ -308,6 +308,9 @@ function popupEntry(value, normalUrgency) {
   // restored rows match the roles of freshly received ones.
   var deadline = Number((value || {}).deadline || 0)
   if (isFinite(deadline) && deadline > 0) entry.deadline = deadline
+  // When a snoozed popup is due back on screen. Only snoozed files carry it.
+  var snoozeUntil = Number((value || {}).snoozeUntil || 0)
+  if (isFinite(snoozeUntil) && snoozeUntil > 0) entry.snoozeUntil = snoozeUntil
   return entry
 }
 
@@ -412,6 +415,97 @@ function popupExpired(entry, duration, now) {
   return (Number(now) - Number((entry || {}).timestamp || 0)) >= lifetime
 }
 
+// ---------------------------------------------------- snoozing
+//
+// A snoozed popup leaves the screen without becoming history: its file moves
+// into the snoozed/ subdirectory carrying the time it is due back, and comes
+// back to the top of the stack as a restored row once that time has passed.
+
+function snoozedEntry(entry, until, normalUrgency) {
+  var snoozed = popupEntry(entry, normalUrgency)
+  delete snoozed.deadline
+  snoozed.snoozeUntil = Number(until)
+  return snoozed
+}
+
+// The times the card's snooze picker offers, soonest first. The first is the
+// default for `snoozeOne`: five minutes before the next :00 or :30, the moment
+// to look again before a meeting on the half hour — skipping to the following
+// mark when that is under a minute away. now is local wall-clock time.
+var SNOOZE_LEAD_MINUTES = 5
+
+function beforeNextHalfHour(now) {
+  var date = new Date(Number(now))
+  date.setSeconds(0, 0)
+  date.setMinutes(date.getMinutes() < 30 ? 30 : 60)
+  var until = date.getTime() - SNOOZE_LEAD_MINUTES * 60000
+  while (until - Number(now) < 60000) until += 30 * 60000
+  return until
+}
+
+function tomorrowMorning(now) {
+  var date = new Date(Number(now))
+  date.setDate(date.getDate() + 1)
+  date.setHours(9, 0, 0, 0)
+  return date.getTime()
+}
+
+// The clock format for snooze times, taken from the bar clock so a picker time
+// reads like the bar does: 12-hour when the clock shows AM/PM, else 24-hour.
+// Without a bar clock, the locale's short time format decides.
+var DEFAULT_CLOCK_FORMAT = "dddd HH:mm"
+
+function snoozeTimeFormat(barLayout, localeTimeFormat) {
+  var pattern = null
+  var layout = barLayout || {}
+  for (var section in layout) {
+    var entries = Array.isArray(layout[section]) ? layout[section] : []
+    for (var i = 0; i < entries.length && pattern === null; i++) {
+      var entry = entries[i]
+      if (entry && entry.id === "omarchy.clock") pattern = String(entry.format || DEFAULT_CLOCK_FORMAT)
+    }
+  }
+  if (pattern === null) pattern = String(localeTimeFormat || "")
+  return /[Aa]/.test(pattern.replace(/'[^']*'/g, "")) ? "h:mm AP" : "HH:mm"
+}
+
+function snoozeOptions(now) {
+  var t = Number(now)
+  return [
+    { kind: "time", label: "", until: beforeNextHalfHour(t) },
+    { kind: "duration", label: "15m", until: t + 15 * 60000 },
+    { kind: "duration", label: "1h", until: t + 60 * 60000 },
+    { kind: "duration", label: "Tomorrow", until: tomorrowMorning(t) }
+  ]
+}
+
+// Split snoozed entries into those due back on screen and those still waiting.
+function dueSnoozes(entries, now) {
+  var due = []
+  var waiting = []
+  var list = Array.isArray(entries) ? entries : []
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i]
+    if (!entry) continue
+    if (Number(entry.snoozeUntil || 0) <= Number(now)) due.push(entry)
+    else waiting.push(entry)
+  }
+  return { due: due, waiting: waiting }
+}
+
+// The popup a due snooze wakes up as. It keeps its file identity (timestamp
+// and id) so the images and history entry it already owns stay attached, and
+// gets a fresh on-screen lifetime as an absolute deadline — judged by its
+// original timestamp it would count as long expired.
+function wokenEntry(entry, duration, now, normalUrgency) {
+  var woken = popupEntry(entry, normalUrgency)
+  delete woken.snoozeUntil
+  delete woken.deadline
+  var lifetime = Number(duration || 0)
+  if (isFinite(lifetime) && lifetime > 0) woken.deadline = Number(now) + lifetime
+  return woken
+}
+
 function popupPlacement(barPosition, barClearance, gapsOut) {
   var position = String(barPosition || "top")
   var clearance = Number(barClearance)
@@ -492,6 +586,13 @@ if (typeof module !== "undefined") {
     serializePopup: serializePopup,
     parsePopupFiles: parsePopupFiles,
     popupExpired: popupExpired,
+    snoozedEntry: snoozedEntry,
+    beforeNextHalfHour: beforeNextHalfHour,
+    tomorrowMorning: tomorrowMorning,
+    snoozeOptions: snoozeOptions,
+    snoozeTimeFormat: snoozeTimeFormat,
+    dueSnoozes: dueSnoozes,
+    wokenEntry: wokenEntry,
     popupPlacement: popupPlacement
   }
 }

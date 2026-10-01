@@ -26,6 +26,7 @@ o.bind("SUPER + comma", "Dismiss last notification", { ipc = "notifications.dism
 o.bind("SUPER + SHIFT + comma", "Dismiss all notifications", { ipc = "notifications.dismissAll" })
 o.bind_toggle("SUPER + CTRL + comma", "Toggle silencing notifications", "notification-silencing")
 o.bind("SUPER + ALT + comma", "Invoke last notification", { ipc = "notifications.invokeLast" })
+o.bind("SUPER + CTRL + SHIFT + comma", "Snooze last notification", { ipc = "notifications.snoozeOne" })
 o.bind("SUPER + SHIFT + ALT + comma", "Open notification history", { ipc = "notifications.showHistory" })
 
 o.bind_toggle("SUPER + CTRL + I", "Toggle locking on idle", "idle")

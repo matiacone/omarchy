@@ -554,6 +554,66 @@ assertEqual(
   'notifications omit the deadline field until a restore sets it'
 )
 
+const snoozed = notifications.snoozedEntry(
+  { id: 3, originalId: 3, summary: 'later', timestamp: 1000, expireTimeout: 4000, deadline: 9000 }, 950000, 1)
+assertEqual(snoozed.snoozeUntil, 950000, 'notifications snooze a popup until the chosen time')
+assertEqual('deadline' in snoozed, false, 'notifications drop the on-screen deadline from a snoozed popup')
+assertEqual(snoozed.timestamp, 1000, 'notifications keep the file identity of a snoozed popup')
+assertEqual(
+  notifications.popupEntry(JSON.parse(notifications.serializePopup(snoozed, 1)), 1).snoozeUntil,
+  snoozed.snoozeUntil,
+  'notifications round-trip snooze times through snoozed files'
+)
+assertEqual(
+  'snoozeUntil' in notifications.popupEntry({ id: 1, timestamp: 5 }, 1),
+  false,
+  'notifications omit the snooze time from popups that are not snoozed'
+)
+
+const at = (h, m, sec) => new Date(2026, 9, 1, h, m, sec || 0).getTime()
+assertEqual(notifications.beforeNextHalfHour(at(14, 10)), at(14, 25), 'snooze lands five minutes before the next half hour')
+assertEqual(notifications.beforeNextHalfHour(at(14, 40, 30)), at(14, 55), 'snooze lands five minutes before the next hour')
+assertEqual(notifications.beforeNextHalfHour(at(14, 27)), at(14, 55), 'snooze skips a mark whose lead time has passed')
+assertEqual(notifications.beforeNextHalfHour(at(14, 24, 30)), at(14, 55), 'snooze skips a mark under a minute away')
+assertEqual(notifications.beforeNextHalfHour(at(23, 50)), at(23, 55), 'snooze lands before midnight')
+assertEqual(notifications.beforeNextHalfHour(at(23, 56)), new Date(2026, 9, 2, 0, 25).getTime(), 'snooze rolls past midnight')
+assertEqual(notifications.tomorrowMorning(at(23, 59)), new Date(2026, 9, 2, 9, 0).getTime(), 'snooze until tomorrow means 9am the next day')
+assertDeepEqual(
+  notifications.snoozeOptions(at(14, 10)).map(o => o.until),
+  [at(14, 25), at(14, 25), at(15, 10), new Date(2026, 9, 2, 9, 0).getTime()],
+  'snooze offers the half-hour mark, 15 minutes, an hour, and tomorrow morning'
+)
+
+assertEqual(
+  notifications.snoozeTimeFormat({ center: [{ id: 'omarchy.clock', format: 'ddd d MMM h:mm AP' }] }, 'HH:mm'),
+  'h:mm AP',
+  'snooze times follow a 12-hour bar clock'
+)
+assertEqual(
+  notifications.snoozeTimeFormat({ left: [], center: [{ id: 'omarchy.clock', format: "dddd HH:mm 'at' " }] }, 'h:mm AP'),
+  'HH:mm',
+  'snooze times follow a 24-hour bar clock, ignoring quoted literals'
+)
+assertEqual(notifications.snoozeTimeFormat({ center: [{ id: 'omarchy.clock' }] }, 'h:mm AP'), 'HH:mm', 'snooze times follow the default bar clock')
+assertEqual(notifications.snoozeTimeFormat(null, 'h:mm AP'), 'h:mm AP', 'snooze times fall back to the locale without a bar clock')
+
+const split = notifications.dueSnoozes([
+  { originalId: 1, snoozeUntil: 100 },
+  { originalId: 2, snoozeUntil: 300 },
+  null
+], 200)
+assertDeepEqual(split.due.map(e => e.originalId), [1], 'notifications wake snoozes that have come due')
+assertDeepEqual(split.waiting.map(e => e.originalId), [2], 'notifications keep snoozes that have not come due')
+
+const woken = notifications.wokenEntry(snoozed, 8000, 2000000, 1)
+assertEqual('snoozeUntil' in woken, false, 'notifications drop the snooze time from a woken popup')
+assertEqual(woken.deadline, 2008000, 'notifications give a woken popup a fresh on-screen lifetime')
+assert(
+  !notifications.popupExpired(woken, 8000, 2004000),
+  'a woken popup survives a restart within its fresh lifetime despite its old timestamp'
+)
+assertEqual('deadline' in notifications.wokenEntry(snoozed, 0, 2000000, 1), false, 'notifications wake critical popups without a deadline')
+
 // The click action (an argv vector) is the only kind that survives a shell
 // restart: a libnotify action leaves its sender waiting on an id from a server
 // generation that no longer exists.
@@ -612,7 +672,8 @@ assert(
   'notifications service keeps history in a subdirectory of the popup state dir'
 )
 assert(
-  /if \(entry\) \{\s*\n\s*archivePopupFileFor\(entry\)[\s\S]{0,200}?popupModel\.remove\(index\)/.test(serviceQml),
+  /archivePopupFileFor\(popupModel\.get\(index\)\)\s*\n\s*takePopupOffScreen\(index, reason\)/.test(serviceQml) &&
+    /function takePopupOffScreen\(index, reason\) \{[\s\S]{0,700}?popupModel\.remove\(index\)/.test(serviceQml),
   'notifications service archives the popup file when a popup leaves the screen'
 )
 assert(
@@ -656,8 +717,20 @@ assert(
   'notifications service re-persists a silenced notification updated while its write was queued'
 )
 assert(
-  /rows\.push\(NotificationLogic\.persistablePopup\(\{[\s\S]{0,400}?\}, imagesDir\)\.entry\)/.test(serviceQml),
+  /rows\.push\(NotificationLogic\.persistablePopup\(plainRow\(row\), imagesDir\)\.entry\)/.test(serviceQml),
   'notifications service replays carried-over toasts from their persisted image copies'
+)
+assert(
+  /snoozedEntry\(\s*persistable\.entry,/.test(serviceQml),
+  'notifications service snoozes toasts from their persisted image copies'
+)
+assert(
+  /\|\| -e \$4\/\$stem\.json \]\]/.test(serviceQml),
+  'notifications service keeps the image copies of snoozed toasts when sweeping orphans'
+)
+assert(
+  /running: service\.snoozedEntries\.length > 0 && !service\.doNotDisturb/.test(serviceQml),
+  'notifications service holds snoozed toasts back while silenced'
 )
 assert(
   /function sweepOrphanImages\(\)[\s\S]{0,400}?\|\| rm -f \\"\$img\\"/.test(serviceQml),

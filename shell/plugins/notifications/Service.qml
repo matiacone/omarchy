@@ -37,6 +37,10 @@ Item {
   // originals don't outlive the notification (see persistablePopup). Each
   // copy lives and dies with the JSON file whose stem it carries.
   readonly property string imagesDir: popupStateDir + "images/"
+  // Popups snoozed off the screen, one file each, carrying the time they are
+  // due back. A file moves in here from popupStateDir when its toast is
+  // snoozed and back out when it wakes.
+  readonly property string snoozedDir: popupStateDir + "snoozed/"
   // Corner radius is shared with the menu and shell panels.
   // It mirrors Hyprland's current decoration:rounding value.
   readonly property int cornerRadius: Style.cornerRadius
@@ -50,6 +54,9 @@ Item {
   readonly property int defaultBarSize: barVertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
   readonly property int liveBarSize: shell && shell.bar && !shell.bar.barHidden ? Math.max(0, shell.bar.barSize) : defaultBarSize
   readonly property int barClearance: liveBarSize + Style.gapsOut
+  // Snooze picker times read like the bar clock.
+  readonly property string snoozeTimeFormat: NotificationLogic.snoozeTimeFormat(
+    shell && shell.barConfig ? shell.barConfig.layout : null, Qt.locale().timeFormat(Locale.ShortFormat))
 
   // Live Notification objects by originalId, kept OUT of the ListModels: a
   // QObject stored in a model role becomes a dangling C++ pointer when the
@@ -355,6 +362,17 @@ Item {
 
   function removePopup(index, reason) {
     if (index < 0 || index >= popupModel.count) return
+    // The popup is leaving the screen — for any reason — so its file must not
+    // survive to the next shell restart. It becomes the newest history entry
+    // instead. Rows that never had a file (a history replay, the empty-history
+    // placeholder) archive to nothing, which the move tolerates.
+    archivePopupFileFor(popupModel.get(index))
+    takePopupOffScreen(index, reason)
+  }
+
+  // Take a toast off the screen and let its server object go, once the caller
+  // has decided where its file goes.
+  function takePopupOffScreen(index, reason) {
     var entry = popupModel.get(index)
     var originalId = entry ? entry.originalId : -1
     // A restored row has no live server object, and its old-generation id
@@ -362,14 +380,7 @@ Item {
     // id would dismiss that unrelated notification at the server.
     var restored = isRestoredRow(entry)
     var ref = !restored && originalId >= 0 ? liveRefs[originalId] : null
-    // The popup is leaving the screen — for any reason — so its file must not
-    // survive to the next shell restart. It becomes the newest history entry
-    // instead. Rows that never had a file (a history replay, the empty-history
-    // placeholder) archive to nothing, which the move tolerates.
-    if (entry) {
-      archivePopupFileFor(entry)
-      if (restored) delete restoredPopups[NotificationLogic.popupFileName(entry)]
-    }
+    if (entry && restored) delete restoredPopups[NotificationLogic.popupFileName(entry)]
     popupModel.remove(index)
     if (ref) {
       try {
@@ -385,6 +396,62 @@ Item {
 
   function clearPopups() {
     while (popupModel.count > 0) dismissPopup(0)
+  }
+
+  // ---------------------------------------------------- snoozing
+  //
+  // A snoozed toast leaves the screen like a dismissal — its sender is told it
+  // closed — but its file moves into snoozedDir instead of history, and the
+  // toast comes back on top of the stack once the snooze runs out. It comes
+  // back as a restored row: the sender's live notification is gone by then, so
+  // a click runs the persisted --exec command or focuses the sending app.
+
+  // Entries waiting in snoozedDir, mirrored here so the wake timer needn't
+  // read the directory.
+  property var snoozedEntries: []
+
+  // until is an absolute wall-clock time; see NotificationLogic.snoozeOptions.
+  function snoozePopup(index, until) {
+    if (index < 0 || index >= popupModel.count) return false
+    var row = popupModel.get(index)
+    // The empty-history placeholder is not a notification.
+    if (!row || row.originalId < 0) return false
+
+    // Point at the persisted image copies: the sender deletes its originals
+    // once it hears the notification closed, long before the toast wakes.
+    var persistable = NotificationLogic.persistablePopup(plainRow(row), imagesDir)
+    var snoozed = NotificationLogic.snoozedEntry(persistable.entry, until, NotificationUrgency.Normal)
+    snoozePopupFile(snoozed, persistable.copies)
+    snoozedEntries = snoozedEntries.concat([snoozed])
+    takePopupOffScreen(index, "dismiss")
+    return true
+  }
+
+  function wakeSnoozedPopups() {
+    var split = NotificationLogic.dueSnoozes(snoozedEntries, Date.now())
+    if (split.due.length === 0) return
+    snoozedEntries = split.waiting
+
+    for (var i = 0; i < split.due.length; i++) {
+      var due = split.due[i]
+      var woken = NotificationLogic.wokenEntry(
+        due, durationFor(due.urgency, due.expireTimeout), Date.now(), NotificationUrgency.Normal)
+      wakePopupFile(woken)
+      // deadline is persistence metadata, not a model role — see restorePopups.
+      delete woken.deadline
+      restoredPopups[NotificationLogic.popupFileName(woken)] = true
+      popupModel.insert(0, woken)
+    }
+  }
+
+  // Coarse on purpose: a snooze is minutes long, and checking the wall clock
+  // (rather than counting down) keeps a suspend from stretching it. Silencing
+  // holds snoozed toasts back until it is turned off.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: service.snoozedEntries.length > 0 && !service.doNotDisturb
+    onTriggered: service.wakeSnoozedPopups()
   }
 
   // Run the popup's click action, then dismiss. Omarchy's own toasts carry the
@@ -446,7 +513,7 @@ Item {
 
   Process {
     id: ensureDirsProc
-    command: ["mkdir", "-p", service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir]
+    command: ["mkdir", "-p", service.stateDir, service.popupStateDir, service.historyDir, service.imagesDir, service.snoozedDir]
     running: false
   }
 
@@ -587,6 +654,39 @@ Item {
       imagesDir])
   }
 
+  // Move a snoozed popup's file into snoozedDir, rewritten with its wake time
+  // and its image copies (made at arrival, refreshed here while the sender
+  // still has the originals).
+  function snoozePopupFile(entry, copies) {
+    var command = ["bash", "-c",
+      "mkdir -p \"$1\" \"$2\" || exit 0\n" +
+      "dir=\"$1\" live=\"$3\" name=\"$4\" json=\"$5\"\n" +
+      "shift 5\n" +
+      copyImagesScript +
+      "printf '%s\\n' \"$json\" > \"$dir/$name\" || exit 0\n" +
+      "rm -f \"$live/$name\"", "--",
+      snoozedDir,
+      imagesDir,
+      popupStateDir,
+      NotificationLogic.popupFileName(entry),
+      NotificationLogic.serializePopup(entry, NotificationUrgency.Normal)]
+    for (var i = 0; i < copies.length; i++) command.push(copies[i].from, copies[i].to)
+    enqueuePopupFileJob(command)
+  }
+
+  // Bring a woken popup's file back out as a live popup file. Written before
+  // the snoozed copy goes, so a restart in between finds it in one place or
+  // both, never neither.
+  function wakePopupFile(entry) {
+    enqueuePopupFileJob(["bash", "-c",
+      "printf '%s\\n' \"$3\" > \"$1/$4\" || exit 0\n" +
+      "rm -f \"$2/$4\"", "--",
+      popupStateDir,
+      snoozedDir,
+      NotificationLogic.serializePopup(entry, NotificationUrgency.Normal),
+      NotificationLogic.popupFileName(entry)])
+  }
+
   // Record a notification that never made it to the screen (DND silenced it),
   // straight into history. Same file format as an archived popup, so the
   // replay can't tell the two apart.
@@ -639,8 +739,8 @@ Item {
       "  [[ $img == *.tmp ]] && { rm -f -- \"$img\"; continue; }\n" +
       "  stem=\"${img##*/}\"\n" +
       "  stem=\"${stem%-*}\"\n" +
-      "  [[ -e $1/$stem.json || -e $2/$stem.json ]] || rm -f \"$img\"\n" +
-      "done", "--", popupStateDir, historyDir, imagesDir])
+      "  [[ -e $1/$stem.json || -e $2/$stem.json || -e $4/$stem.json ]] || rm -f \"$img\"\n" +
+      "done", "--", popupStateDir, historyDir, imagesDir, snoozedDir])
   }
 
   Process {
@@ -692,21 +792,28 @@ Item {
     for (var i = 0; i < popupModel.count; i++) {
       var row = popupModel.get(i)
       if (!row || row.originalId < 0) continue
-      rows.push(NotificationLogic.persistablePopup({
-        id: row.id,
-        originalId: row.originalId,
-        app: row.app,
-        appIcon: row.appIcon,
-        summary: row.summary,
-        body: row.body,
-        image: row.image,
-        glyph: row.glyph || "",
-        execArgv: row.execArgv || "",
-        urgency: row.urgency,
-        timestamp: row.timestamp
-      }, imagesDir).entry)
+      rows.push(NotificationLogic.persistablePopup(plainRow(row), imagesDir).entry)
     }
     return rows
+  }
+
+  // A plain copy of a popup row: the model hands out live proxies that go
+  // stale as soon as the row is removed.
+  function plainRow(row) {
+    return {
+      id: row.id,
+      originalId: row.originalId,
+      app: row.app,
+      appIcon: row.appIcon,
+      summary: row.summary,
+      body: row.body,
+      image: row.image,
+      glyph: row.glyph || "",
+      execArgv: row.execArgv || "",
+      urgency: row.urgency,
+      expireTimeout: row.expireTimeout,
+      timestamp: row.timestamp
+    }
   }
 
   function replayHistory(raw) {
@@ -811,6 +918,23 @@ Item {
     })
   }
 
+  Process {
+    id: restoreSnoozedProc
+    running: false
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var entries = NotificationLogic.parsePopupFiles(text, NotificationUrgency.Normal)
+        // A file without a wake time can't be scheduled; wake it right away
+        // rather than strand it.
+        for (var i = 0; i < entries.length; i++) {
+          if (!entries[i].snoozeUntil) entries[i].snoozeUntil = Date.now()
+        }
+        service.snoozedEntries = service.snoozedEntries.concat(entries)
+      }
+    }
+  }
+
   // ---------------------------------------------------- settings persistence
 
   FileView {
@@ -881,6 +1005,11 @@ Item {
       restorePopupsProc.command = ["bash", "-c",
         "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", service.popupStateDir]
       restorePopupsProc.running = true
+      // Snoozes outlive the shell too; the wake timer picks up any that came
+      // due while it was down.
+      restoreSnoozedProc.command = ["bash", "-c",
+        "awk 1 \"$1\"/*.json 2>/dev/null || true", "--", service.snoozedDir]
+      restoreSnoozedProc.running = true
       // Safe beside the restore read: it only re-persists entries whose
       // JSON exists, exactly the images the sweep keeps.
       service.sweepOrphanImages()
@@ -942,6 +1071,20 @@ Item {
       if (popupModel.count === 0) return "none"
       service.dismissPopup(0)
       return "ok"
+    }
+
+    // Take the most recent popup off the screen until five minutes before
+    // the next half hour, the picker's first choice.
+    function snoozeOne(): string {
+      if (popupModel.count === 0) return "none"
+      return service.snoozePopup(0, NotificationLogic.beforeNextHalfHour(Date.now())) ? "ok" : "none"
+    }
+
+    // Take the most recent popup off the screen for a number of minutes.
+    function snooze(minutes: string): string {
+      var m = Number(minutes)
+      if (popupModel.count === 0 || !isFinite(m) || m <= 0) return "none"
+      return service.snoozePopup(0, Date.now() + m * 60000) ? "ok" : "none"
     }
 
     // Fire the default action on the most recent popup, then dismiss it.
@@ -1095,8 +1238,10 @@ Item {
               cornerRadius: service.cornerRadius
               fontFamily: service.shell && service.shell.bar ? service.shell.bar.fontFamily : ""
               glyph: cardSlot.glyph
+              snoozeTimeFormat: service.snoozeTimeFormat
 
               onCloseRequested: service.dismissPopup(cardSlot.index)
+              onSnoozeRequested: function(until) { service.snoozePopup(cardSlot.index, until) }
               onCardClicked: service.invokePopupDefault(cardSlot.index)
             }
           }
